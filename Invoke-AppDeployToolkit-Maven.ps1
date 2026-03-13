@@ -5,20 +5,17 @@ PSAppDeployToolkit - This script performs the installation or uninstallation of 
 
 .DESCRIPTION
 - Downloads Apache Maven 3.9.14 binary zip from the Apache CDN.
-- Extracts and copies the Maven files to C:\apache-maven-3.9.14.
-- Sets MAVEN_HOME and JAVA_HOME as user-level environment variables for all profiles.
-- Appends Maven bin directory to the user-level PATH for all profiles.
+- Extracts and copies the Maven files to C:\Temp\apache-maven-3.9.14.
+- Sets MAVEN_HOME as a user-level environment variable for all profiles.
+- Appends %MAVEN_HOME%\bin to the user-level PATH for all profiles.
 - Registers a logon scheduled task to broadcast WM_SETTINGCHANGE to running processes.
 - Designed for Intune Win32 app deployment (runs as SYSTEM context).
-
-The script imports the PSAppDeployToolkit module which contains the logic and functions required to install or uninstall an application.
 
 .PARAMETER DeploymentType
 The type of deployment to perform.
 
 .PARAMETER DeployMode
-Specifies whether the installation should be run in Interactive (shows dialogs), Silent (no dialogs),
-NonInteractive (dialogs without prompts) mode, or Auto.
+Specifies whether the installation should be run in Interactive, Silent, NonInteractive, or Auto mode.
 
 .PARAMETER SuppressRebootPassThru
 Suppresses the 3010 return code from being passed back to the parent process.
@@ -105,29 +102,30 @@ $adtSession = @{
     DeployAppScriptVersion      = '4.1.7'
 }
 
+
 ##================================================
 ## MARK: Package-level constants
+## All paths defined here - change MavenVersion only when upgrading.
 ##================================================
 
-# Maven version and download details
+# Maven version - update this single value when upgrading
 $Script:MavenVersion     = '3.9.14'
+
+# Download details
 $Script:MavenZipName     = "apache-maven-$Script:MavenVersion-bin.zip"
 $Script:MavenDownloadUrl = "https://dlcdn.apache.org/maven/maven-3/$Script:MavenVersion/binaries/$Script:MavenZipName"
 
-# Where the zip will be staged during install
+# Staging location for the downloaded zip and extraction (cleaned up post-install)
 $Script:MavenStagingDir  = 'C:\Temp\MavenStaging'
 $Script:MavenZipPath     = "$Script:MavenStagingDir\$Script:MavenZipName"
 
-# Final installation directory (top-level Maven home)
-$Script:MavenDestPath    = "C:\apache-maven-$Script:MavenVersion"
-
-# The folder name that the zip extracts to internally (Apache standard convention)
+# The folder name Apache zips always extract to internally
 $Script:MavenZipFolder   = "apache-maven-$Script:MavenVersion"
 
-# Java destination path (set by OpenJDK 17 package - referenced here for JAVA_HOME consistency)
-$Script:JavaDestPath     = 'C:\Temp\Openjdk17'
+# Final installation destination - under C:\Temp as per deployment instructions
+$Script:MavenDestPath    = "C:\Temp\apache-maven-$Script:MavenVersion"
 
-# Drop location for the WM_SETTINGCHANGE broadcast helper script
+# Drop location for WM_SETTINGCHANGE broadcast helper script
 $Script:MavenHelperDir    = 'C:\ProgramData\ApacheMaven'
 $Script:MavenHelperScript = 'C:\ProgramData\ApacheMaven\Invoke-RefreshMavenHome.ps1'
 
@@ -140,10 +138,9 @@ $Script:DetectionKey      = 'HKLM\SOFTWARE\InstalledApps\Apache Software Foundat
 
 ##================================================
 ## MARK: Helper - Download Maven zip
-## Uses BITS for download with a curl/Invoke-WebRequest fallback.
-## BITS is preferred for enterprise environments as it is bandwidth-aware
-## and resumable. Falls back gracefully if BITS is unavailable (e.g. disabled
-## on some hardened builds).
+## Attempts BITS first (bandwidth-aware, enterprise-preferred),
+## falls back to Invoke-WebRequest. Validates file size post-download
+## to catch silent failures (e.g. CDN returning an HTML error page).
 ##================================================
 
 function Get-MavenZip
@@ -152,6 +149,13 @@ function Get-MavenZip
     param ()
 
     Write-ADTLogEntry -Message "Downloading Apache Maven $Script:MavenVersion from [$Script:MavenDownloadUrl]..."
+
+    # Ensure C:\Temp exists before staging
+    if (-not (Test-Path -LiteralPath 'C:\Temp' -PathType Container))
+    {
+        New-Item -Path 'C:\Temp' -ItemType Directory -Force | Out-Null
+        Write-ADTLogEntry -Message 'Created C:\Temp directory.'
+    }
 
     # Ensure staging directory exists
     if (-not (Test-Path -LiteralPath $Script:MavenStagingDir -PathType Container))
@@ -180,7 +184,7 @@ function Get-MavenZip
         Write-ADTLogEntry -Message "BITS download failed, falling back to Invoke-WebRequest - $_" -Severity 2
     }
 
-    # Attempt 2 - Invoke-WebRequest (standard PowerShell)
+    # Attempt 2 - Invoke-WebRequest
     if (-not $downloaded)
     {
         try
@@ -202,7 +206,7 @@ function Get-MavenZip
         }
     }
 
-    # Validate the file was actually saved and has a reasonable size (zip should be > 8 MB)
+    # Validate file exists and is a reasonable size (Maven zip should be > 8 MB)
     if (-not (Test-Path -LiteralPath $Script:MavenZipPath))
     {
         throw "Download appeared to succeed but zip file was not found at [$Script:MavenZipPath]."
@@ -211,7 +215,7 @@ function Get-MavenZip
     $fileSize = (Get-Item -LiteralPath $Script:MavenZipPath).Length
     if ($fileSize -lt 8MB)
     {
-        throw "Downloaded file is suspiciously small ($fileSize bytes). The download may have failed or the URL may have changed."
+        throw "Downloaded file is suspiciously small ($fileSize bytes). The download may have failed or the CDN URL may have changed."
     }
 
     Write-ADTLogEntry -Message "Maven zip downloaded successfully. File size: $([math]::Round($fileSize / 1MB, 2)) MB"
@@ -219,10 +223,10 @@ function Get-MavenZip
 
 
 ##================================================
-## MARK: Helper - Extract and stage Maven files
-## Extracts the zip to the staging directory and then moves the inner
-## apache-maven-3.9.14 folder to the final destination C:\apache-maven-3.9.14.
-## Clears the destination first for idempotency (safe re-runs/upgrades).
+## MARK: Helper - Extract and install Maven files
+## Extracts the zip to staging, copies inner apache-maven-3.9.14 folder
+## contents to C:\Temp\apache-maven-3.9.14, validates mvn.cmd exists,
+## then cleans up the staging directory.
 ##================================================
 
 function Install-MavenFiles
@@ -232,7 +236,7 @@ function Install-MavenFiles
 
     Write-ADTLogEntry -Message "Extracting Maven zip to staging directory [$Script:MavenStagingDir]..."
 
-    # Clean any previous extraction in the staging area
+    # Clean any previous extraction attempt in staging
     $extractedPath = Join-Path -Path $Script:MavenStagingDir -ChildPath $Script:MavenZipFolder
     if (Test-Path -LiteralPath $extractedPath)
     {
@@ -249,13 +253,13 @@ function Install-MavenFiles
         throw "Failed to extract Maven zip - $_"
     }
 
-    # Verify the expected folder exists inside the extraction
+    # Verify the expected inner folder exists post-extraction
     if (-not (Test-Path -LiteralPath $extractedPath -PathType Container))
     {
-        throw "Expected extracted folder [$extractedPath] was not found. The zip structure may have changed."
+        throw "Expected extracted folder [$extractedPath] was not found. The zip structure may have changed - verify the Apache download manually."
     }
 
-    # Clear destination directory for a clean install/upgrade
+    # Clear destination for a clean idempotent install (safe for upgrades and re-runs)
     if (Test-Path -LiteralPath $Script:MavenDestPath)
     {
         Write-ADTLogEntry -Message "Clearing existing Maven destination [$Script:MavenDestPath]..."
@@ -272,28 +276,29 @@ function Install-MavenFiles
     Copy-Item -Path "$extractedPath\*" -Destination $Script:MavenDestPath -Recurse -Force -ErrorAction Stop
     Write-ADTLogEntry -Message 'Maven files copied to destination successfully.'
 
-    # Validate mvn.cmd exists as a post-copy sanity check
+    # Post-copy sanity check - validate mvn.cmd is present
     $mvnCmd = Join-Path -Path $Script:MavenDestPath -ChildPath 'bin\mvn.cmd'
     if (-not (Test-Path -LiteralPath $mvnCmd))
     {
-        throw "Post-copy validation failed: [$mvnCmd] not found. The extracted zip may be corrupt or the directory structure has changed."
+        throw "Post-copy validation failed: [$mvnCmd] not found. The extracted zip may be corrupt."
     }
 
     Write-ADTLogEntry -Message "Maven installation validated. mvn.cmd found at [$mvnCmd]."
 
-    # Clean up staging directory after successful copy
-    Write-ADTLogEntry -Message 'Cleaning up staging directory...'
+    # Clean up staging directory
+    Write-ADTLogEntry -Message 'Cleaning up Maven staging directory...'
     Remove-Item -LiteralPath $Script:MavenStagingDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-ADTLogEntry -Message 'Staging directory removed.'
 }
 
 
 ##================================================
 ## MARK: Helper - Register WM_SETTINGCHANGE broadcast task
-## Identical pattern to the OpenJDK 17 package - drops a helper script
-## to C:\ProgramData\ApacheMaven and registers an AtLogOn scheduled task
-## for BUILTIN\Users. The task broadcasts WM_SETTINGCHANGE so running
-## processes (terminals, IDEs) see the new env vars without a full logoff.
-## The task self-deletes after its first execution.
+## Drops a helper script to C:\ProgramData\ApacheMaven and registers
+## an AtLogOn scheduled task for BUILTIN\Users (limited/non-elevated).
+## The task broadcasts WM_SETTINGCHANGE so already-running processes
+## (terminals, IDEs) see the new env vars without a full logoff.
+## The helper script self-deletes the task after its first execution.
 ##================================================
 
 function Register-EnvRefreshTask
@@ -368,21 +373,22 @@ finally
     }
 
     Register-ScheduledTask @registerParams | Out-Null
-
     Write-ADTLogEntry -Message "Scheduled task [$Script:RefreshTaskName] registered successfully."
 }
 
 
 ##================================================
 ## MARK: Helper - Set Maven user environment variables for all profiles
-## Sets MAVEN_HOME and appends %MAVEN_HOME%\bin to the user PATH.
-## Uses Invoke-ADTAllUsersRegistryAction to write HKCU from SYSTEM context.
+## Sets MAVEN_HOME = C:\Temp\apache-maven-3.9.14 and appends
+## %MAVEN_HOME%\bin to the user PATH.
 ##
-## PATH handling strategy:
-##   - Read existing user PATH value from HKCU\Environment
-##   - Only append %MAVEN_HOME%\bin if it is not already present
-##   - Use the expandable string type (REG_EXPAND_SZ) so %MAVEN_HOME%
-##     resolves dynamically - consistent with Windows PATH conventions
+## Uses Invoke-ADTAllUsersRegistryAction to write HKCU values safely
+## from SYSTEM context (Intune deployment requirement).
+##
+## PATH handling:
+##   - Reads existing user PATH value
+##   - Only appends %MAVEN_HOME%\bin if not already present (idempotent)
+##   - Writes as REG_EXPAND_SZ so %MAVEN_HOME% resolves dynamically
 ##================================================
 
 function Set-MavenUserEnvironment
@@ -390,18 +396,18 @@ function Set-MavenUserEnvironment
     [CmdletBinding()]
     param ()
 
-    Write-ADTLogEntry -Message 'Setting MAVEN_HOME and updating user PATH for all profiles...'
+    Write-ADTLogEntry -Message "Setting MAVEN_HOME=[$Script:MavenDestPath] and updating user PATH for all profiles..."
 
     Invoke-ADTAllUsersRegistryAction -ScriptBlock {
 
-        # Set MAVEN_HOME
-        Set-ADTRegistryKey -Key 'HKCU\Environment' -Name 'MAVEN_HOME' -Value 'C:\apache-maven-3.9.14' -Type 'String' -SID $_.SID
+        # Set MAVEN_HOME pointing to C:\Temp\apache-maven-3.9.14
+        Set-ADTRegistryKey -Key 'HKCU\Environment' -Name 'MAVEN_HOME' -Value 'C:\Temp\apache-maven-3.9.14' -Type 'String' -SID $_.SID
 
-        # Read current user PATH (REG_EXPAND_SZ) - may not exist for some profiles
+        # Read current user PATH - may not exist for some profiles
         $currentPath = (Get-ADTRegistryKey -Key 'HKCU\Environment' -Value 'Path' -SID $_.SID -ErrorAction SilentlyContinue)
         if (-not $currentPath) { $currentPath = '' }
 
-        # Only add Maven bin to PATH if not already present (prevents duplicate entries on re-runs)
+        # Only add Maven bin to PATH if not already present (prevents duplicates on re-runs)
         $mavenBinEntry = '%MAVEN_HOME%\bin'
         if ($currentPath -notlike "*$mavenBinEntry*")
         {
@@ -423,6 +429,8 @@ function Set-MavenUserEnvironment
 
 ##================================================
 ## MARK: Helper - Remove Maven user environment variables from all profiles
+## Surgically removes MAVEN_HOME and strips %MAVEN_HOME%\bin from PATH.
+## Does NOT wipe the entire PATH value.
 ##================================================
 
 function Remove-MavenUserEnvironment
@@ -437,7 +445,7 @@ function Remove-MavenUserEnvironment
         # Remove MAVEN_HOME
         Remove-ADTRegistryKey -Key 'HKCU\Environment' -Name 'MAVEN_HOME' -SID $_.SID
 
-        # Strip %MAVEN_HOME%\bin from the user PATH
+        # Strip %MAVEN_HOME%\bin from the user PATH without touching other entries
         $currentPath = (Get-ADTRegistryKey -Key 'HKCU\Environment' -Value 'Path' -SID $_.SID -ErrorAction SilentlyContinue)
         if ($currentPath)
         {
@@ -469,8 +477,9 @@ function Install-ADTDeployment
     ##--------------------------------------------
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
-    # Pre-create destination directory
-    Write-ADTLogEntry -Message "Ensuring Maven destination directory exists: [$Script:MavenDestPath]"
+    # Ensure C:\Temp and destination directory exist before download begins
+    Write-ADTLogEntry -Message 'Ensuring C:\Temp and Maven destination directory exist...'
+    New-Item -Path 'C:\Temp' -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
     New-Item -Path $Script:MavenDestPath -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
 
     ##--------------------------------------------
@@ -478,10 +487,10 @@ function Install-ADTDeployment
     ##--------------------------------------------
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    # Step 1 - Download Maven zip
+    # Step 1 - Download Maven zip from Apache CDN
     Get-MavenZip
 
-    # Step 2 - Extract and copy to C:\apache-maven-3.9.14
+    # Step 2 - Extract and copy to C:\Temp\apache-maven-3.9.14
     Install-MavenFiles
 
     ##--------------------------------------------
@@ -501,6 +510,7 @@ function Install-ADTDeployment
     }
 
     # Step 4 - Register logon task to broadcast env change to running processes
+    # Non-fatal - env vars are already set in registry even if this fails
     try
     {
         Register-EnvRefreshTask
@@ -529,7 +539,7 @@ function Uninstall-ADTDeployment
     ##--------------------------------------------
     $adtSession.InstallPhase = "Pre-$($adtSession.DeploymentType)"
 
-    # Remove refresh task before main uninstall
+    # Remove the refresh task first so it cannot fire mid-removal
     Write-ADTLogEntry -Message "Removing scheduled task [$Script:RefreshTaskName] if present..."
     Unregister-ScheduledTask -TaskName $Script:RefreshTaskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -538,7 +548,7 @@ function Uninstall-ADTDeployment
     ##--------------------------------------------
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    # Step 1 - Remove Maven files
+    # Remove Maven installation directory from C:\Temp
     if (Test-Path -LiteralPath $Script:MavenDestPath)
     {
         Write-ADTLogEntry -Message "Removing Maven installation at [$Script:MavenDestPath]..."
@@ -555,7 +565,7 @@ function Uninstall-ADTDeployment
     ##--------------------------------------------
     $adtSession.InstallPhase = "Post-$($adtSession.DeploymentType)"
 
-    # Step 2 - Remove MAVEN_HOME and PATH entry from all user profiles
+    # Remove MAVEN_HOME and PATH entry from all user profiles
     try
     {
         Remove-MavenUserEnvironment
@@ -565,20 +575,20 @@ function Uninstall-ADTDeployment
         Write-ADTLogEntry -Message "WARNING: Error removing Maven environment variables from user profiles (non-fatal) - $_" -Severity 2
     }
 
-    # Step 3 - Remove helper script directory
+    # Remove helper script directory
     if (Test-Path -LiteralPath $Script:MavenHelperDir)
     {
         Write-ADTLogEntry -Message "Removing helper directory [$Script:MavenHelperDir]..."
         Remove-Item -LiteralPath $Script:MavenHelperDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # Step 4 - Remove staging directory if it somehow remains
+    # Remove staging directory if it somehow remains from a failed install
     if (Test-Path -LiteralPath $Script:MavenStagingDir)
     {
         Remove-Item -LiteralPath $Script:MavenStagingDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # Step 5 - Master Wrapper detection key
+    # Master Wrapper detection key
     Remove-ADTRegistryKey -Key $Script:DetectionKey
 }
 
@@ -602,7 +612,7 @@ function Repair-ADTDeployment
     ##--------------------------------------------
     $adtSession.InstallPhase = $adtSession.DeploymentType
 
-    # Re-download and re-copy Maven files in case the installation was corrupted
+    # Re-download and re-copy Maven files to restore a potentially corrupt installation
     Get-MavenZip
     Install-MavenFiles
 
